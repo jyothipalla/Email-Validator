@@ -1,0 +1,4 @@
+dnspython
+email-validator
+pandas
+streamlit
