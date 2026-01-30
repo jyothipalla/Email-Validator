@@ -1,168 +1,80 @@
-import csv
+import pandas as pd
 import dns.resolver
-import socket
-import smtplib
-import re
 import os
-from email_validator import validate_email, EmailNotValidError
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # --- CONFIGURATION ---
 INPUT_FILE = "BOOK1.csv"
-VALID_OUT = "Valid_Emails.csv"
-RISKY_OUT = "Risky_Emails.csv"
+OUTPUT_FILE = "DKIM_FINAL_REPORT.csv"
 
-# Global timeout for network checks
-socket.setdefaulttimeout(10)
+# These are the "keys" used to find DKIM. 
+# Added 'selector1' and 'selector2' at the top for Microsoft 365.
+SELECTORS = [
+    'selector1', 'selector2', 'google', 's1', 's2', 
+    'default', 'mail', 'k1', 'picasso', 'mandrill'
+]
 
-def get_dns_data(domain):
-    """Checks MX, SPF, DKIM, and DMARC."""
-    res = {"mx": "FAIL", "spf": "FAIL", "dkim": "FAIL", "dmarc": "FAIL", "server": "Unknown"}
-    try:
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = 2
-        resolver.lifetime = 2
-        
-        # MX & Server Provider
+def get_dkim_data(email):
+    """
+    Looks up DKIM records and returns a dictionary.
+    This structure ensures every row has the same columns.
+    """
+    domain = str(email).split('@')[-1].strip()
+    result = {
+        "EMAIL": email,
+        "DKIM_STATUS": "FAIL",
+        "DKIM_REPORT": "No Selector Match", # This is your missing column
+        "SCAN_TIME": time.strftime("%H:%M:%S")
+    }
+
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 2
+    resolver.lifetime = 2
+
+    for s in SELECTORS:
         try:
-            mx_query = resolver.resolve(domain, "MX")
-            res["mx"] = "PASS"
-            primary_mx = str(mx_query[0].exchange).lower()
-            if "google" in primary_mx: res["server"] = "Google Workspace"
-            elif "outlook" in primary_mx: res["server"] = "Microsoft 365"
-            else: res["server"] = "Private SMTP"
-        except: pass
-
-        # SPF
-        try:
-            txt = resolver.resolve(domain, "TXT")
-            for r in txt:
-                if "v=spf1" in str(r): res["spf"] = "PASS"
-        except: pass
-
-        # DMARC
-        try:
-            resolver.resolve(f"_dmarc.{domain}", "TXT")
-            res["dmarc"] = "PASS"
-        except: pass
-
-        # DKIM (Common selectors)
-        for s in ['google', 'default', 'mail', 'k1']:
-            try:
-                resolver.resolve(f"{s}._domainkey.{domain}", "TXT")
-                res["dkim"] = "PASS"
-                break
-            except: continue
-    except: pass
-    return res
-
-def check_smtp(email, domain, server_type):
-    """Checks SMTP availability (Handshake)."""
-    if "Google" in server_type or "Microsoft" in server_type:
-        return "PROTECTED"
-    try:
-        mx_records = dns.resolver.resolve(domain, 'MX')
-        mail_server = str(mx_records[0].exchange)
-        with smtplib.SMTP(mail_server, timeout=3) as smtp:
-            smtp.helo()
-            smtp.mail('verify@test.com')
-            code, _ = smtp.rcpt(email)
-            return "AVAILABLE" if code == 250 else "NOT_FOUND"
-    except:
-        return "UNVERIFIABLE"
-
-def process_row(row):
-    if not row or not row[0]: return None
-    email = row[0].strip()
-    
-    # Defaults
-    status = "Invalid Syntax"
-    score = 0
-
-    try:
-        # 1. Validation Status
-        valid = validate_email(email)
-        domain = valid.domain
-        status = "Valid Format"
-        
-        # 2. DNS Checks
-        dns_data = get_dns_data(domain)
-        
-        # 3. SMTP Check
-        smtp_status = check_smtp(email, domain, dns_data["server"])
-        
-        # --- SCORING LOGIC ---
-        if dns_data["mx"] == "PASS": score += 20
-        if dns_data["spf"] == "PASS": score += 10
-        if dns_data["dkim"] == "PASS": score += 10
-        if dns_data["dmarc"] == "PASS": score += 10
-        if smtp_status in ["AVAILABLE", "PROTECTED"]: score += 50
-        
-        # Penalty for numbers in name
-        if re.match(r'^\d+', email.split('@')[0]): score -= 30
-
-        # --- FINAL 9-COLUMN RETURN ---
-        return [
-            email,              # EMAIL
-            dns_data["spf"],    # SPF
-            smtp_status,        # SMTP
-            dns_data["dkim"],   # DKIM
-            dns_data["dmarc"],  # DMARC
-            dns_data["mx"],     # MX
-            status,             # VALIDATION STATUS
-            dns_data["server"], # SERVER
-            max(0, score)       # DELIVERABILITY SCORE
-        ]
-
-    except Exception:
-        return [email, "FAIL", "INVALID", "FAIL", "FAIL", "FAIL", "Syntax Error", "N/A", 0]
+            path = f"{s}._domainkey.{domain}"
+            query = resolver.resolve(path, "TXT")
+            for rdata in query:
+                record = rdata.to_text()
+                if "v=DKIM1" in record or "p=" in record:
+                    result["DKIM_STATUS"] = f"PASS ({s})"
+                    result["DKIM_REPORT"] = "Record Found Successfully"
+                    return result
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            continue 
+        except Exception as e:
+            result["DKIM_REPORT"] = f"Error: {type(e).__name__}"
+            break
+            
+    return result
 
 def main():
     if not os.path.exists(INPUT_FILE):
-        print(f"Error: {INPUT_FILE} not found in {os.getcwd()}")
+        print(f"Error: {INPUT_FILE} not found!")
         return
 
-    # Read Data
-    with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
-        reader = list(csv.reader(f))
-        if len(reader) < 2: return
-        header_in = reader[0]
-        rows = reader[1:]
+    print("Step 1: Loading emails...")
+    df_in = pd.read_csv(INPUT_FILE)
+    email_list = df_in.iloc[:, 0].dropna().tolist()
 
-    print(f"Auditing {len(rows)} emails... Please wait.")
-
-    # Process Rows
+    print(f"Step 2: Scanning {len(email_list)} emails for DKIM...")
     with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(process_row, rows))
+        audit_results = list(executor.map(get_dkim_data, email_list))
 
-    # --- SEGMENTATION LOGIC ---
-    # 1. Score > 50 (Valid)
-    valid_data = [r for r in results if r is not None and r[-1] > 50]
-    # 2. Score 1 to 50 (Risky)
-    risky_data = [r for r in results if r is not None and 0 < r[-1] <= 50]
-    # 3. Score 0 (Deleted/Filtered out)
-    deleted_count = len([r for r in results if r is not None and r[-1] == 0])
+    print("Step 3: Forcing column generation...")
+    df_out = pd.DataFrame(audit_results)
 
-    # Final Output Header
-    full_header = ["EMAIL", "SPF", "SMTP", "DKIM", "DMARC", "MX", "STATUS", "SERVER", "SCORE"]
+    # REORDERING: This forces DKIM_REPORT to be the third column so you can't miss it
+    df_out = df_out[["EMAIL", "DKIM_STATUS", "DKIM_REPORT", "SCAN_TIME"]]
 
-    # Write Valid File
-    with open(VALID_OUT, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(full_header)
-        writer.writerows(valid_data)
-
-    # Write Risky File
-    with open(RISKY_OUT, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(full_header)
-        writer.writerows(risky_data)
-
+    # Save to a completely new file
+    df_out.to_csv(OUTPUT_FILE, index=False)
+    
     print("-" * 30)
-    print(f"SUCCESS: Files Generated Successfully")
-    print(f"✅ Valid (>50): {len(valid_data)} saved to {VALID_OUT}")
-    print(f"⚠️ Risky (1-50): {len(risky_data)} saved to {RISKY_OUT}")
-    print(f"🗑️ Deleted (0): {deleted_count} junk emails removed.")
+    print(f"SUCCESS! New report created: {OUTPUT_FILE}")
+    print(f"Location: {os.path.abspath(OUTPUT_FILE)}")
     print("-" * 30)
 
 if __name__ == "__main__":
